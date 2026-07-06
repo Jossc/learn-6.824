@@ -136,6 +136,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if args.PrevLogIndex > 0 && rf.log[args.preLogIndex].term != args.PrevLogTerm {
 		fmt.Println("prelog term not match")
+		reply.Term = rf.currentTerm
 		return
 	}
 
