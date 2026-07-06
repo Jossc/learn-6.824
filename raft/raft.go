@@ -34,6 +34,10 @@ type Raft struct {
 	peers         []*labrpc.ClientEnd
 	applyCh       chan ApplyMsg
 	lastHeartbeat time.Time
+	nextIndex     []int // Leader：每个 Follower 下一条该发的 index
+	matchIndex    []int // Leader：每个 Follower 已匹配的最高 index
+	commitIndex   int   // 已提交的最高 index
+	lastApplied   int   // 已应用到状态机的最高 index
 }
 type RequestVoteArgs struct {
 	Term         int // 候选人的 term
@@ -47,8 +51,15 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	preLogIndex  int
+	entries      []LogEntry
+	leaderCommit int
+	PrevLogIndex int        // 新条目前一条的 index
+	PrevLogTerm  int        // 新条目前一条的 term
+	Entries      []LogEntry // 要复制的日志（心跳时为空）
+	LeaderCommit int        // Leader 的 commitIndex
 }
 type AppendEntriesReply struct {
 	Term     int
@@ -117,21 +128,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	fmt.Print(rf.currentTerm, " ", args.Term, " ", args.LeaderId)
+
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = Follower
 		rf.votedFor = -1
-
 	}
+	if args.PrevLogIndex > 0 && rf.log[args.preLogIndex].term != args.PrevLogTerm {
+		fmt.Println("prelog term not match")
+		return
+	}
+
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
+	commitNode := min(args.LeaderCommit, len(rf.log)-1)
+	if commitNode > rf.commitIndex {
+		rf.commitIndex = commitNode
+	}
 	reply.Success = true
 	//重置选举闹钟
 	rf.lastHeartbeat = time.Now()
 	reply.Term = rf.currentTerm
+	// 发送日志
+	for i, entry := range args.entries {
+		idx := args.PrevLogIndex + i + 1
+		if idx < len(rf.log) && rf.log[idx].term != entry.term {
+			rf.log = rf.log[idx:]
+			rf.log = append(rf.log[:idx], entry)
+		}
+		if idx >= len(rf.log) {
+			rf.log = append(rf.log, entry)
+		}
+	}
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -238,11 +269,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-// Start 提交命令到日志（2B 实现）
+// Start
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	return -1, -1, false
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != Leader {
+		return -1, -1, false
+	}
+	rf.log = append(rf.log, LogEntry{term: rf.currentTerm, Command: command})
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 // readPersist 从持久化数据恢复状态
 func (rf *Raft) readPersist(data []byte) {
+
 }
