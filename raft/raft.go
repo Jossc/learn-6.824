@@ -155,13 +155,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 发送日志
 	for i, entry := range args.entries {
 		idx := args.PrevLogIndex + i + 1
-		if idx < len(rf.log) && rf.log[idx].term != entry.term {
-			rf.log = rf.log[idx:]
-			rf.log = append(rf.log[:idx], entry)
+		if idx < len(rf.log) {
+			if rf.log[idx].term != entry.term {
+				rf.log = rf.log[:idx] // 截断
+			} else {
+				continue // 已匹配，跳过
+			}
 		}
-		if idx >= len(rf.log) {
-			rf.log = append(rf.log, entry)
-		}
+		rf.log = append(rf.log, entry) // 到这一定是需要追加的
 	}
 }
 
