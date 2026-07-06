@@ -134,17 +134,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.role = Follower
 		rf.votedFor = -1
 	}
-	if args.PrevLogIndex > 0 && rf.log[args.preLogIndex].term != args.PrevLogTerm {
-		fmt.Println("prelog term not match")
-		reply.Term = rf.currentTerm
-		return
-	}
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
+
+	if args.PrevLogIndex > 0 && rf.log[args.preLogIndex].term != args.PrevLogTerm {
+		fmt.Println("prelog term not match")
+		reply.Term = rf.currentTerm
+		return
+	}
+
 	commitNode := min(args.LeaderCommit, len(rf.log)-1)
 	if commitNode > rf.commitIndex {
 		rf.commitIndex = commitNode
