@@ -227,6 +227,12 @@ func (rf *Raft) ticker() {
 			}
 			wg.Wait()
 		} else if rf.role == Leader {
+			rf.nextIndex = make([]int, len(rf.peers))
+			rf.matchIndex = make([]int, len(rf.peers))
+			for i := range rf.nextIndex {
+				rf.nextIndex[i] = len(rf.log)
+			}
+			prevLongIndex := rf.nextIndex[server] - 1
 			args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
 			rf.mu.Unlock()
 			for i := 0; i < len(rf.peers); i++ {
@@ -270,6 +276,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 初始化持久化状态
 	rf.readPersist(persister.ReadRaftState())
 	go rf.ticker()
+	go func() {
+		for {
+			rf.mu.Lock()
+			for rf.commitIndex > rf.lastApplied {
+				rf.lastApplied++
+				msg := ApplyMsg{CommandIndex: rf.lastApplied,
+					Command: rf.log[rf.lastApplied].Command}
+				rf.mu.Unlock()
+				rf.applyCh <- msg
+				rf.mu.Lock()
+			}
+			rf.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
 	return rf
 }
 
