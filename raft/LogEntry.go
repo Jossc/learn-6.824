@@ -1,8 +1,8 @@
 package raft
 
 type LogEntry struct {
-	info    string
-	version int
-	term    int
+	Info    string
+	Version int
+	Term    int
 	Command interface{}
 }

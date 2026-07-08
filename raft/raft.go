@@ -53,18 +53,17 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
-	preLogIndex  int
-	entries      []LogEntry
-	leaderCommit int
 	PrevLogIndex int        // 新条目前一条的 index
 	PrevLogTerm  int        // 新条目前一条的 term
 	Entries      []LogEntry // 要复制的日志（心跳时为空）
 	LeaderCommit int        // Leader 的 commitIndex
 }
 type AppendEntriesReply struct {
-	Term     int
-	LeaderId int
-	Success  bool
+	Term          int
+	LeaderId      int
+	Success       bool
+	ConflictIndex int // 冲突的日志
+	ConflictTerm  int // 冲突的任期
 }
 
 /*
@@ -113,6 +112,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		return
 	}
+	//候选人最后一条日志 term 比我的大 → 比我新
+	//term 相等但 index ≥ 我的 → 比我新
+	//否则 → 拒绝
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.log[lastLogIndex].Term
+	}
+	logOk := args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+	if !logOk {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
 	// 3. 还没投票 or 已经投给这个人 → 投票
 	if args.CandidateId == rf.votedFor || rf.votedFor == -1 {
 		reply.VoteGranted = true
@@ -141,8 +154,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIndex > 0 && rf.log[args.preLogIndex].term != args.PrevLogTerm {
+	// PrevLogIndex 的边界检查
+	if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) {
 		fmt.Println("prelog term not match")
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			fmt.Println("prelog term not match")
+			rf.log = rf.log[:args.PrevLogIndex]
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			return
+		}
+	} else if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
@@ -156,16 +179,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastHeartbeat = time.Now()
 	reply.Term = rf.currentTerm
 	// 发送日志
-	for i, entry := range args.entries {
+	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + i + 1
 		if idx < len(rf.log) {
-			if rf.log[idx].term != entry.term {
-				rf.log = rf.log[:idx] // 截断
+			if rf.log[idx].Term != entry.Term {
+				rf.log = rf.log[:idx]
 			} else {
-				continue // 已匹配，跳过
+				continue
 			}
 		}
-		rf.log = append(rf.log, entry) // 到这一定是需要追加的
+		rf.log = append(rf.log, entry)
+
 	}
 }
 
@@ -188,15 +212,19 @@ func (rf *Raft) ticker() {
 		ms := 300 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
-		if rf.role != Leader && time.Since(rf.lastHeartbeat) > 300*time.Millisecond {
+		if rf.role != Leader && time.Since(rf.lastHeartbeat) > time.Duration(ms)*time.Millisecond {
 			rf.role = Candidate
 			rf.currentTerm++
 			rf.votedFor = rf.me
+			lastLogTerm := 0
+			if len(rf.log) > 0 {
+				lastLogTerm = rf.log[len(rf.log)-1].Term
+			}
 			args := RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogIndex: len(rf.log) - 1,
-				LastLogTerm:  0, // 2B 再补
+				LastLogTerm:  lastLogTerm, // 2B 再补
 			}
 			rf.mu.Unlock()
 			votes := 1
@@ -219,21 +247,29 @@ func (rf *Raft) ticker() {
 					mu.Lock()
 					if votes > len(rf.peers)/2 {
 						rf.mu.Lock()
-						rf.role = Leader
+						if rf.role == Candidate && rf.currentTerm == args.Term {
+							rf.role = Leader
+							rf.nextIndex = make([]int, len(rf.peers))
+							rf.matchIndex = make([]int, len(rf.peers))
+							for i := range rf.nextIndex {
+								rf.nextIndex[i] = len(rf.log)
+							}
+						}
 						rf.mu.Unlock()
 					}
 					mu.Unlock()
 				}(i)
 			}
 			wg.Wait()
+			continue
 		} else if rf.role == Leader {
-			rf.nextIndex = make([]int, len(rf.peers))
+			/*rf.nextIndex = make([]int, len(rf.peers))
 			rf.matchIndex = make([]int, len(rf.peers))
 			for i := range rf.nextIndex {
 				rf.nextIndex[i] = len(rf.log)
 			}
 			prevLongIndex := rf.nextIndex[server] - 1
-			args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
+			args := AppendEntriesArgs{Term: rf.currentTerm, leaderId: rf.me}
 			rf.mu.Unlock()
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
@@ -243,7 +279,85 @@ func (rf *Raft) ticker() {
 					reply := AppendEntriesReply{}
 					rf.sendAppendEntries(server, &args, &reply)
 				}(i)
+			}*/
+			// Leader 不改 nextIndex/matchIndex（当选时已初始化）
+			// 只读快照，避免持锁发 RPC
+			/*	savedTerm := rf.currentTerm
+				savedLogLen := len(rf.log)
+				savedCommitIndex := rf.commitIndex*/
+			rf.mu.Unlock()
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				go func(server int) {
+					rf.mu.Lock()
+					prevLogIndex := rf.nextIndex[server] - 1
+					var preLogTerm int
+					if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
+						preLogTerm = rf.log[prevLogIndex].Term
+					}
+					//开始发送日志 entries
+					entries := make([]LogEntry, 0)
+					for j := rf.nextIndex[server]; j < len(rf.log); j++ {
+						entries = append(entries, rf.log[j])
+					}
+					args := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  preLogTerm,
+						Entries:      entries,
+						LeaderCommit: rf.commitIndex,
+					}
+					rf.mu.Unlock()
+					reply := AppendEntriesReply{}
+					ok := rf.sendAppendEntries(server, &args, &reply)
+					if !ok {
+						return
+					}
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.role = Follower
+						rf.votedFor = -1
+						rf.mu.Unlock()
+						return
+					}
+					if reply.Success {
+						// 复制成功，更新 matchIndex 和 nextIndex
+						rf.matchIndex[server] = prevLogIndex + len(entries)
+						rf.nextIndex[server] = rf.matchIndex[server] + 1
+						// 推进 commitIndex：找多数派已复制的最大 index
+						for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+							// 只提交当前 term 的日志
+							if rf.log[N].Term != rf.currentTerm {
+								continue
+							}
+							count := 1
+							for j := range rf.peers {
+								if j != rf.me && rf.matchIndex[j] >= N {
+									count++
+								}
+							}
+							if count > len(rf.peers)/2 {
+								rf.commitIndex = N
+								break
+							}
+
+						}
+					} else {
+						// 冲突，回退 nextIndex
+						rf.nextIndex[server]--
+						if rf.nextIndex[server] < 1 {
+							rf.nextIndex[server] = 1
+						}
+					}
+					rf.mu.Unlock()
+
+				}(i)
 			}
+
 		} else {
 			rf.mu.Unlock()
 		}
@@ -301,11 +415,76 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.role != Leader {
 		return -1, -1, false
 	}
-	rf.log = append(rf.log, LogEntry{term: rf.currentTerm, Command: command})
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 // readPersist 从持久化数据恢复状态
 func (rf *Raft) readPersist(data []byte) {
 
+}
+
+func (rf *Raft) sendHeartbeat(server int) {
+	rf.mu.Lock()
+	if rf.role != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	prevLogIndex := rf.nextIndex[server] - 1
+	var prevLogTerm int
+	if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
+		prevLogTerm = rf.log[prevLogIndex].Term
+	}
+	entries := make([]LogEntry, 0)
+	for j := rf.nextIndex[server]; j < len(rf.log); j++ {
+		entries = append(entries, rf.log[j])
+	}
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	if !ok {
+		return
+	}
+	rf.mu.Lock()
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.mu.Unlock()
+		return
+	}
+	if reply.Success {
+		rf.matchIndex[server] = prevLogIndex + len(entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+			if rf.log[N].Term != rf.currentTerm {
+				continue
+			}
+			count := 1
+			for j := range rf.peers {
+				if j != rf.me && rf.matchIndex[j] >= N {
+					count++
+				}
+			}
+			if count > len(rf.peers)/2 {
+				rf.commitIndex = N
+				break
+			}
+		}
+	} else {
+		rf.nextIndex[server]--
+		if rf.nextIndex[server] < 1 {
+			rf.nextIndex[server] = 1
+		}
+	}
+	rf.mu.Unlock()
 }
